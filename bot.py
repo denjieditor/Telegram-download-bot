@@ -3,8 +3,10 @@ import asyncio
 import logging
 import re
 import tempfile
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
@@ -17,6 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+PORT = int(os.environ.get("PORT", 8080))
 
 YOUTUBE_PATTERN = re.compile(
     r"(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+"
@@ -26,6 +29,22 @@ POCKETFM_PATTERN = re.compile(
 )
 
 executor = ThreadPoolExecutor(max_workers=4)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"Health server running on port {PORT}")
+    server.serve_forever()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -176,8 +195,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             await msg.edit_text(
-                f"✅ Download complete!\n"
-                f"📤 Uploading to Telegram..."
+                "✅ Download complete!\n"
+                "📤 Uploading to Telegram..."
             )
 
             if audio_only or file_ext in [".mp3", ".m4a", ".aac", ".ogg"]:
@@ -325,6 +344,9 @@ async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
