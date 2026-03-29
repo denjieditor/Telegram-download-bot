@@ -99,89 +99,128 @@ def is_direct_link(url: str) -> bool:
     return url.startswith("http://") or url.startswith("https://")
 
 
-def ytdlp_download(url: str, audio_only: bool = False) -> tuple:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        if audio_only:
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-                "quiet": True,
-                "no_warnings": True,
-            }
-        else:
-            ydl_opts = {
-                "format": "best[filesize<50M]/best[height<=720]/best",
-                "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-                "quiet": True,
-                "no_warnings": True,
-            }
+MAX_TG_SIZE = 50 * 1024 * 1024
+MAX_SUPPORTED_SIZE = 5 * 1024 * 1024 * 1024
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Downloaded file")
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{round(size_bytes / (1024**3), 2)} GB"
+    elif size_bytes >= 1024 * 1024:
+        return f"{round(size_bytes / (1024**2), 1)} MB"
+    elif size_bytes >= 1024:
+        return f"{round(size_bytes / 1024, 1)} KB"
+    return f"{size_bytes} B"
+
+
+def ytdlp_smart_download(url: str, audio_only: bool = False) -> dict:
+    info_opts = {
+        "format": "bestaudio/best" if audio_only else "best[height<=1080]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    with yt_dlp.YoutubeDL(info_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    title = info.get("title", "Downloaded file")
+    direct_url = info.get("url", "")
+    filesize = info.get("filesize") or info.get("filesize_approx") or 0
+    ext = info.get("ext", "mp4")
+
+    if filesize > MAX_SUPPORTED_SIZE:
+        raise Exception(f"File is too large even for link sharing ({format_size(filesize)}). Max supported: 5GB.")
+
+    if filesize > MAX_TG_SIZE or (filesize == 0 and not audio_only):
+        return {
+            "type": "link",
+            "url": direct_url,
+            "title": title,
+            "size": filesize,
+            "ext": ext,
+        }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dl_opts = {
+            "format": "bestaudio/best" if audio_only else "best[filesize<50M]/best[height<=720]/best",
+            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+        }
+        if audio_only:
+            dl_opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
+
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            ydl.extract_info(url, download=True)
 
         files = list(Path(tmpdir).iterdir())
         if not files:
-            raise Exception("File could not be downloaded.")
+            return {"type": "link", "url": direct_url, "title": title, "size": filesize, "ext": ext}
 
         file_path = str(files[0])
         file_ext = Path(file_path).suffix
         with open(file_path, "rb") as f:
             file_data = f.read()
 
-    return file_data, title, file_ext
+        if len(file_data) > MAX_TG_SIZE:
+            return {"type": "link", "url": direct_url, "title": title, "size": len(file_data), "ext": ext}
 
-
-def ytdlp_get_url(url: str, audio_only: bool = False) -> tuple:
-    ydl_opts = {
-        "format": "bestaudio/best" if audio_only else "best[height<=1080]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
+    return {
+        "type": "file",
+        "data": file_data,
+        "title": title,
+        "ext": file_ext,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get("title", "Video")
-        direct_url = info.get("url", "")
-        filesize = info.get("filesize") or info.get("filesize_approx") or 0
-        ext = info.get("ext", "mp4")
-    return direct_url, title, filesize, ext
 
 
-def direct_download(url: str) -> tuple:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+def direct_download(url: str) -> dict:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     response = requests.get(url, headers=headers, stream=True, timeout=60)
     response.raise_for_status()
 
     content_disposition = response.headers.get("Content-Disposition", "")
-    if "filename=" in content_disposition:
-        filename = content_disposition.split("filename=")[-1].strip('"').strip()
-    else:
-        filename = url.split("/")[-1].split("?")[0] or "downloaded_file"
+    filename = (
+        content_disposition.split("filename=")[-1].strip('"').strip()
+        if "filename=" in content_disposition
+        else url.split("/")[-1].split("?")[0] or "downloaded_file"
+    )
 
     content_length = int(response.headers.get("Content-Length", 0))
 
-    if content_length > 50 * 1024 * 1024:
-        size_mb = round(content_length / (1024 * 1024), 1)
-        raise Exception(f"LARGE_FILE:{size_mb}:{filename}:{url}")
+    if content_length > MAX_SUPPORTED_SIZE:
+        raise Exception(f"File is larger than 5GB ({format_size(content_length)}). Cannot process.")
+
+    if content_length > MAX_TG_SIZE:
+        return {"type": "link", "url": url, "filename": filename, "size": content_length}
 
     chunks = []
     total = 0
     for chunk in response.iter_content(chunk_size=1024 * 1024):
         if chunk:
             total += len(chunk)
-            if total > 50 * 1024 * 1024:
-                raise Exception(f"LARGE_FILE:50+:{filename}:{url}")
+            if total > MAX_TG_SIZE:
+                return {"type": "link", "url": url, "filename": filename, "size": total}
             chunks.append(chunk)
 
-    return b"".join(chunks), filename
+    return {"type": "file", "data": b"".join(chunks), "filename": filename}
+
+
+async def send_large_file_link(msg, title_or_name: str, size: int, link: str, is_video: bool = True):
+    icon = "🎬" if is_video else "📁"
+    size_text = format_size(size) if size else "Unknown"
+    await msg.edit_text(
+        f"📦 File is {size_text} — Too Large for Telegram!\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} {title_or_name}\n\n"
+        f"✅ Direct Download Link:\n"
+        f"{link}\n\n"
+        f"👆 Open this link in browser or IDM/ADM to download!\n"
+        f"⚠️ Link may expire in a few hours."
+    )
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,7 +234,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = await update.message.reply_text("🔍 Analyzing your link...")
-
     loop = asyncio.get_event_loop()
 
     try:
@@ -203,110 +241,62 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             audio_only = is_pocketfm_link(url)
             platform = "Pocket FM" if is_pocketfm_link(url) else "YouTube"
             icon = "🎙️" if is_pocketfm_link(url) else "🎬"
-            await msg.edit_text(
-                f"{icon} {platform} link detected!\n"
-                f"⏳ Downloading... Please wait."
-            )
+            await msg.edit_text(f"{icon} {platform} link detected!\n⏳ Processing... Please wait.")
 
-            try:
-                file_data, title, file_ext = await loop.run_in_executor(
-                    executor, ytdlp_download, url, audio_only
-                )
+            result = await loop.run_in_executor(executor, ytdlp_smart_download, url, audio_only)
 
-                await msg.edit_text(
-                    "✅ Download complete!\n"
-                    "📤 Uploading to Telegram..."
-                )
-
-                if audio_only or file_ext in [".mp3", ".m4a", ".aac", ".ogg"]:
-                    suffix = ".mp3" if audio_only else file_ext
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                        f.write(file_data)
-                        tmp_path = f.name
-                    try:
-                        with open(tmp_path, "rb") as f:
-                            await update.message.reply_audio(
-                                audio=f,
-                                title=title,
-                                filename=f"{title}{suffix}"
-                            )
-                    finally:
-                        os.unlink(tmp_path)
-                else:
-                    suffix = file_ext if file_ext else ".mp4"
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                        f.write(file_data)
-                        tmp_path = f.name
-                    try:
-                        with open(tmp_path, "rb") as f:
-                            await update.message.reply_video(
-                                video=f,
-                                caption=f"🎬 {title}",
-                                supports_streaming=True
-                            )
-                    finally:
-                        os.unlink(tmp_path)
-
-            except Exception as inner_e:
-                if "requested format is not available" in str(inner_e).lower() or "no video formats" in str(inner_e).lower() or len(str(inner_e)) > 200:
-                    raise inner_e
-                await msg.edit_text(f"⚠️ File is too large for direct upload!\n⏳ Getting download link...")
-                direct_url, title, filesize, ext = await loop.run_in_executor(
-                    executor, ytdlp_get_url, url, audio_only
-                )
-                size_text = f"{round(filesize / (1024*1024), 1)} MB" if filesize else "Unknown size"
-                await msg.edit_text(
-                    f"📦 File Too Large for Telegram!\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🎬 {title}\n"
-                    f"📏 Size: {size_text}\n\n"
-                    f"✅ Direct Download Link:\n"
-                    f"{direct_url}\n\n"
-                    f"👆 Copy this link and open in browser/IDM to download!"
-                )
+            if result["type"] == "link":
+                await send_large_file_link(msg, result["title"], result["size"], result["url"], not audio_only)
                 return
 
-        else:
-            await msg.edit_text(
-                "🌐 Direct link detected!\n"
-                "⏳ Downloading file... Please wait."
-            )
-            try:
-                file_data, filename = await loop.run_in_executor(
-                    executor, direct_download, url
-                )
-                await msg.edit_text(
-                    "✅ Download complete!\n"
-                    "📤 Uploading to Telegram..."
-                )
-                suffix = "." + filename.split(".")[-1] if "." in filename else ""
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            file_data = result["data"]
+            title = result["title"]
+            file_ext = result["ext"]
+
+            await msg.edit_text("✅ Download complete!\n📤 Uploading to Telegram...")
+
+            if audio_only or file_ext in [".mp3", ".m4a", ".aac", ".ogg"]:
+                suffix = ".mp3" if audio_only else file_ext
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
                     f.write(file_data)
                     tmp_path = f.name
                 try:
                     with open(tmp_path, "rb") as f:
-                        await update.message.reply_document(document=f, filename=filename)
+                        await update.message.reply_audio(audio=f, title=title, filename=f"{title}{suffix}")
+                finally:
+                    os.unlink(tmp_path)
+            else:
+                suffix = file_ext if file_ext else ".mp4"
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                    f.write(file_data)
+                    tmp_path = f.name
+                try:
+                    with open(tmp_path, "rb") as f:
+                        await update.message.reply_video(video=f, caption=f"🎬 {title}", supports_streaming=True)
                 finally:
                     os.unlink(tmp_path)
 
-            except Exception as inner_e:
-                err = str(inner_e)
-                if err.startswith("LARGE_FILE:"):
-                    parts = err.split(":", 3)
-                    size_mb = parts[1] if len(parts) > 1 else "?"
-                    filename = parts[2] if len(parts) > 2 else "file"
-                    orig_url = parts[3] if len(parts) > 3 else url
-                    await msg.edit_text(
-                        f"📦 File Too Large for Telegram!\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📁 {filename}\n"
-                        f"📏 Size: {size_mb} MB\n\n"
-                        f"✅ Direct Download Link:\n"
-                        f"{orig_url}\n\n"
-                        f"👆 Copy this link and open in browser/IDM/Downloader to download!"
-                    )
-                    return
-                raise inner_e
+        else:
+            await msg.edit_text("🌐 Direct link detected!\n⏳ Downloading file... Please wait.")
+            result = await loop.run_in_executor(executor, direct_download, url)
+
+            if result["type"] == "link":
+                await send_large_file_link(msg, result["filename"], result["size"], result["url"], False)
+                return
+
+            file_data = result["data"]
+            filename = result["filename"]
+
+            await msg.edit_text("✅ Download complete!\n📤 Uploading to Telegram...")
+            suffix = "." + filename.split(".")[-1] if "." in filename else ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                f.write(file_data)
+                tmp_path = f.name
+            try:
+                with open(tmp_path, "rb") as f:
+                    await update.message.reply_document(document=f, filename=filename)
+            finally:
+                os.unlink(tmp_path)
 
         await msg.delete()
 
